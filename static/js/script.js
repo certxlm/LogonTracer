@@ -628,22 +628,22 @@ function createQuery() {
   var dateStr = getDateRange();
 
   if (selectVal == "Username") {
-    whereStr = 'user.user =~ "' + setStr + '" ';
+    whereStr = 'user.user CONTAINS "' + setStr + '" ';
   } else if (selectVal == "IPAddress") {
-    whereStr = 'ip.hostname =~ "' + setStr + '" ';
+    whereStr = 'ip.hostname CONTAINS "' + setStr + '" ';
   } else {
-    whereStr = 'ip.IP =~ "' + setStr + '" ';
+    whereStr = 'ip.IP CONTAINS "' + setStr + '" ';
   }
 
   for (i = 1; i <= currentNumber; i++) {
     if (document.getElementById("query-input" + i).value) {
       ruleStr = document.getElementById("InputRule" + i).value;
       if (document.getElementById("InputSelect" + i).value == "Username") {
-        whereStr += ruleStr + ' user.user =~ "' + document.getElementById("query-input" + i).value + '" ';
+        whereStr += ruleStr + ' user.user CONTAINS "' + document.getElementById("query-input" + i).value + '" ';
       } else if (document.getElementById("InputSelect" + i).value == "IPAddress") {
-        whereStr += ruleStr + ' ip.IP =~ "' + document.getElementById("query-input" + i).value + '" ';
+        whereStr += ruleStr + ' ip.IP CONTAINS "' + document.getElementById("query-input" + i).value + '" ';
       } else {
-        whereStr += ruleStr + ' ip.hostname =~ "' + document.getElementById("query-input" + i).value + '" ';
+        whereStr += ruleStr + ' ip.hostname CONTAINS "' + document.getElementById("query-input" + i).value + '" ';
       }
     }
   }
@@ -663,10 +663,10 @@ function searchPath() {
   var dateStr = getDateRange();
   dateStr = dateStr.slice(5);
 
-  queryStr = 'MATCH (from:Username) WHERE from.user = "' + setStr + '" \
-              MATCH (to:Username) WHERE to.rights = "system" \
-              MATCH (user:Username) WHERE user IN shortestPath((from)-[:Event*]-(to)) \
-              MATCH (ip:IPAddress) WHERE ip IN shortestPath((from)-[:Event*]-(to)) \
+  queryStr = 'MATCH (from:Username { user:"' + setStr + '" }), (to:Username { rights:"system"}), p = shortestPath((from)-[:Event*]-(to)) \
+              WITH p \
+              MATCH (user:Username) WHERE user IN nodes(p) \
+              MATCH (ip:IPAddress) WHERE ip IN nodes(p) \
               MATCH (user)-[event]-(ip) WHERE ' + dateStr + ' \
               RETURN user, ip, event'
 
@@ -688,6 +688,7 @@ function sendQuery(queryStr, root) {
   var loading = document.getElementById('loading');
   loading.classList.remove('loaded');
 
+  var session = driver.session();
   session.run(queryStr)
     .subscribe({
       onNext: function(record) {
@@ -727,6 +728,7 @@ This function executes the neo4j query.
 function executeQuery(queryStr, root) {
   var countStr = queryStr.replace("user, event, ip", "COUNT(event)");
 
+  var session = driver.session();
   session.run(countStr)
     .subscribe({
       onNext: function(record) {
@@ -767,6 +769,7 @@ function diffQuery() {
 
   queryStr1st = 'MATCH (user)-[event:Event]-(ip)  WHERE event.date >= ' + date1st + ' AND event.date <= ' + (date1st + 86400) + ' RETURN user, event, ip';
 
+  var session = driver.session();
   session.run(queryStr1st)
     .subscribe({
       onNext: function(record) {
@@ -802,6 +805,7 @@ function diffNext(graph1) {
   var loading = document.getElementById('loading');
   loading.classList.remove('loaded');
 
+  var session = driver.session();
   session.run(queryStr2nd)
     .subscribe({
       onNext: function(record) {
@@ -842,8 +846,8 @@ function getArrayDiff(arr1, arr2) {
 function nodeConcat(arr1, arr2) {
   let arr = arr1.nodes.concat(arr2.nodes);
   return arr.filter((v, i)=> {
-    console.log(arr2.edges)
-    console.log(arr)
+    //console.log(arr2.edges)
+    //console.log(arr)
     return (arr2.edges.findIndex(obj => obj.data.source === v.data.id) >= 0 ||
             arr2.edges.findIndex(obj => obj.data.target === v.data.id) >= 0);
   });
@@ -894,6 +898,8 @@ function pagerankQuery(queryStr, dataType, currentPage) {
     '</th></tr></thead><tbody class="col-sm-2 col-md-2">';
   var startRunk = currentPage * 10;
   queryStr = queryStr + " SKIP " + startRunk + " LIMIT " + 10;
+
+  var session = driver.session();
   session.run(queryStr)
     .subscribe({
       onNext: function(record) {
@@ -932,6 +938,7 @@ function exportCSV() {
   var queryStr = 'MATCH (user:Username)-[event:Event]-(ip:IPAddress) RETURN user, ip, event';
   var events = new Array();
 
+  var session = driver.session();
   session.run(queryStr)
     .subscribe({
       onNext: function(record) {
@@ -993,6 +1000,7 @@ function downloadCSV(csvType) {
   var queryStr = 'MATCH (date:Date) MATCH (user:Username) RETURN date, user';
   var users = new Array();
 
+  var session = driver.session();
   session.run(queryStr)
     .subscribe({
       onNext: function(record) {
@@ -1090,6 +1098,7 @@ function createTimeline(queryStr, tableType) {
     }
   }
 
+  var session = driver.session();
   session.run(queryStr)
     .subscribe({
       onNext: function(record) {
@@ -1267,6 +1276,7 @@ function createTimelineGraph(queryStr) {
   var starttime = "";
   var endtime = "";
 
+  var session = driver.session();
   session.run(queryStr)
     .subscribe({
       onNext: function(record) {
@@ -1452,7 +1462,7 @@ function searchTimeline() {
   var setStr = document.getElementById("query-input").value;
 
   if (selectVal == "Username") {
-    whereStr = 'user.user =~ "' + setStr + '" ';
+    whereStr = 'user.user CONTAINS "' + setStr + '" ';
   } else {
     searchError();
   }
@@ -1460,7 +1470,7 @@ function searchTimeline() {
   for (i = 1; i <= currentNumber; i++) {
     if (document.getElementById("query-input" + i).value) {
       if (document.getElementById("InputSelect" + i).value == "Username") {
-        whereStr += 'or user.user =~ "' + document.getElementById("query-input" + i).value + '" ';
+        whereStr += 'or user.user CONTAINS "' + document.getElementById("query-input" + i).value + '" ';
       } else {
         searchError();
       }
@@ -1476,7 +1486,7 @@ function searchTimeline() {
 }
 
 function clickTimeline(setStr) {
-  whereStr = 'user.user =~ "' + setStr + '" ';
+  whereStr = 'user.user CONTAINS "' + setStr + '" ';
 
   var queryStr = 'MATCH (date:Date) MATCH (user:Username) WHERE (' + whereStr + ') RETURN date, user';
   var gtype = document.getElementById("timelineTypes").checked;
@@ -1495,6 +1505,7 @@ function logdeleteCheck() {
   var queryStr = "MATCH (date:Deletetime) RETURN date";
   var ddata = "";
 
+  var session = driver.session();
   session.run(queryStr)
     .subscribe({
       onNext: function(record) {
@@ -1568,6 +1579,51 @@ function file_upload() {
   }
 }
 
+/*
+load_eventlog
+Load event log from Elasticsearch server.
+*/
+function load_eventlog() {
+  if (!document.getElementById("from-date-time").value) {
+    var fromDateTime = "false";
+  } else {
+    var fromDateTime = formatDateTime(new Date(document.getElementById("from-date-time").value));
+  }
+
+  if (!document.getElementById("to-date-time").value) {
+    var toDateTime = "false";
+  } else {
+    var toDateTime = formatDateTime(new Date(document.getElementById("to-date-time").value));
+  }
+
+  var timezone = document.getElementById("utcTimeES").value;
+  var es_server = document.getElementById("es-ip-input").value;
+  var addlog = document.getElementById("add_logES").checked;
+  var addes = document.getElementById("add_es").checked;
+
+  if (timezone == "Time Zone") {
+    document.getElementById("statusES").innerHTML = '<div class="alert alert-danger"><strong>ERROR</strong>: Please set the time zone of the event logs.</div>';
+  } else {
+    document.getElementById("uploadBarES").innerHTML = '';
+    document.getElementById("statusES").innerHTML = '';
+
+    var formData = new FormData();
+    formData.append("fromdatetime", fromDateTime);
+    formData.append("todatetime", toDateTime);
+    formData.append("timezone", timezone);
+    formData.append("es_server", es_server);
+    formData.append("addlog", addlog);
+    formData.append("addes", addes);
+    var xmlhttp = new XMLHttpRequest();
+    xmlhttp.upload.addEventListener("progress", progressHandlerES, false);
+    xmlhttp.addEventListener("load", completeHandlerES, false);
+    xmlhttp.addEventListener("error", errorHandlerES, false);
+    xmlhttp.addEventListener("abort", abortHandlerES, false);
+    xmlhttp.open("POST", "esload", true);
+    xmlhttp.send(formData);
+  }
+}
+
 function progressHandler(event) {
   var percent = (event.loaded / event.total) * 100;
   document.getElementById("uploadBar").innerHTML = '<h4>Upload ...</h4><div class="progress"><div class="progress-bar progress-bar-striped active" role="progressbar" style="width: ' + Math.round(percent) + '%;">' + Math.round(percent) + '%</div></div>';
@@ -1598,6 +1654,36 @@ function errorHandler(event) {
 
 function abortHandler(event) {
   document.getElementById("status").innerHTML = '<div class="alert alert-info">Upload Aborted</div>';
+}
+
+function progressHandlerES(event) {
+  var percent = (event.loaded / event.total) * 100;
+  document.getElementById("uploadBarES").innerHTML = '<h4>Wait ...</h4><div class="progress"><div class="progress-bar progress-bar-striped active" role="progressbar" style="width: ' + Math.round(percent) + '%;">' + Math.round(percent) + '%</div></div>';
+}
+
+function completeHandlerES(event) {
+  if (event.target.responseText == "FAIL") {
+    document.getElementById("statusES").innerHTML = '<div class="alert alert-danger"><strong>ERROR</strong>: Failed!</div>';
+  }
+  if (event.target.responseText == "SUCCESS") {
+    parse_status = false
+    document.getElementById("uploadBarES").innerHTML = '<h4>Wait ...</h4><div class="progress"><div class="progress-bar progress-bar-success progress-bar-striped" role="progressbar" style="width: 100%;">Waiting ...</div></div>';
+    var loop = function() {
+      if (parse_status == false) {
+        setTimeout(loop, 2000);
+      }
+      parseES();
+    }
+    loop();
+  }
+}
+
+function errorHandlerES(event) {
+  document.getElementById("statusES").innerHTML = '<div class="alert alert-danger"><strong>ERROR</strong>: Load error!</div>';
+}
+
+function abortHandlerES(event) {
+  document.getElementById("statusES").innerHTML = '<div class="alert alert-info">Load Aborted</div>';
 }
 
 /*
@@ -1639,6 +1725,34 @@ function parseEVTX() {
   }
 }
 
+function parseES() {
+  var xmlhttp2 = new XMLHttpRequest();
+  xmlhttp2.open("GET", "/log");
+  xmlhttp2.send();
+  xmlhttp2.onreadystatechange = function() {
+    if (xmlhttp2.readyState == 4) {
+      if (xmlhttp2.status == 200) {
+        var logdata = xmlhttp2.responseText.split(/\r\n|\r|\n/);
+        var nowdata = logdata[logdata.length - 2];
+        if (nowdata.indexOf("Now loading") != -1) {
+          var recordnum = nowdata.split(" ")[3];
+          document.getElementById("uploadBarES").innerHTML = '<h4>Parsing process ...</h4><div class="progress"><div class="progress-bar progress-bar-striped active" role="progressbar" style="width: 100%;">' + recordnum + ' record</div></div>';
+        } else if (nowdata.indexOf("Script end") != -1) {
+          document.getElementById("uploadBarES").innerHTML = '<h4>End  ...</h4><div class="progress"><div class="progress-bar progress-bar-success progress-bar-striped" role="progressbar" style="width: 100%;">SUCCESS</div></div>';
+          document.getElementById("statusES").innerHTML = '<div class="alert alert-info"><strong>Import Success</strong>: You need to reload the web page.</div>';
+          parse_status = true;
+        } else if (nowdata.indexOf("[!]") != -1) {
+          document.getElementById("statusES").innerHTML = '<div class="alert alert-danger"><strong>ERROR</strong>: Load error from Elasticsearch! Please check log.</div>';
+          parse_status = true;
+        }
+      } else {
+        document.getElementById("statusES").innerHTML = '<div class="alert alert-danger"><strong>ERROR</strong>: logontracer.log status =  ' + xmlhttp2.status + '</div>';
+        parse_status = true;
+      }
+    }
+  }
+}
+
 /*
 loaddate
 load date info from neo4j
@@ -1646,6 +1760,7 @@ load date info from neo4j
 function loaddate() {
   var queryStr = 'MATCH (date:Date) RETURN date';
 
+  var session = driver.session();
   session.run(queryStr)
     .subscribe({
       onNext: function(record) {
@@ -1701,6 +1816,18 @@ function loaddate() {
           maxDate: maxDay,
           minDate: minDay
         });
+
+        $('.fromdatetime').datetimepicker({
+          locale: "en",
+          format: "YYYY-MM-DD HH:mm:ss",
+          useCurrent: false
+        });
+
+        $('.todatetime').datetimepicker({
+          locale: "en",
+          format: "YYYY-MM-DD HH:mm:ss",
+          useCurrent: false
+        });
       },
       onError: function(error) {
         console.log("Error: ", error);
@@ -1714,6 +1841,18 @@ var formatDate = function(date) {
   format = format.replace(/MM/g, ('0' + (date.getMonth() + 1)).slice(-2));
   format = format.replace(/DD/g, ('0' + date.getDate()).slice(-2));
   format = format.replace(/hh/g, ('0' + date.getHours()).slice(-2));
+
+  return format;
+};
+
+var formatDateTime = function(date) {
+  format = "YYYY-MM-DDThh:mm:ss";
+  format = format.replace(/YYYY/g, date.getFullYear());
+  format = format.replace(/MM/g, ('0' + (date.getMonth() + 1)).slice(-2));
+  format = format.replace(/DD/g, ('0' + date.getDate()).slice(-2));
+  format = format.replace(/hh/g, ('0' + date.getHours()).slice(-2));
+  format = format.replace(/mm/g, ('0' + date.getMinutes()).slice(-2));
+  format = format.replace(/ss/g, ('0' + date.getSeconds()).slice(-2));
 
   return format;
 };

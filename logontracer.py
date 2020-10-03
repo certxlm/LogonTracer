@@ -13,6 +13,7 @@ import shutil
 import argparse
 import datetime
 import subprocess
+from ssl import create_default_context
 
 try:
     from lxml import etree
@@ -21,14 +22,13 @@ except ImportError:
     has_lxml = False
 
 try:
-    from Evtx.Evtx import Evtx
-    from Evtx.Views import evtx_file_xml_view
+    from evtx import PyEvtxParser
     has_evtx = True
 except ImportError:
     has_evtx = False
 
 try:
-    from py2neo import Graph, Database
+    from py2neo import Graph, GraphService
     has_py2neo = True
 except ImportError:
     has_py2neo = False
@@ -69,6 +69,13 @@ try:
 except ImportError:
     has_sklearn = False
 
+try:
+    from elasticsearch import Elasticsearch
+    from elasticsearch_dsl import Search, Q
+    has_es = True
+except ImportError:
+    has_es = False
+
 # neo4j password
 NEO4J_PASSWORD = "password"
 # neo4j user name
@@ -83,6 +90,14 @@ WEB_PORT = 8080
 WEB_HOST = "0.0.0.0"
 # Websocket port
 WS_PORT = 7687
+# Elastic Search server
+ES_SERVER = "localhost:9200"
+# Elastic index
+ES_INDEX = "winlogbeat-*"
+# Elastic prefix
+ES_PREFIX = "winlog"
+# Elastic auth user
+ES_USER = "elastic"
 
 # Check Event Id
 EVENT_ID = [4624, 4625, 4662, 4768, 4769, 4776, 4672, 4720, 4726, 4728, 4729, 4732, 4733, 4756, 4757, 4719, 5137, 5141]
@@ -185,12 +200,30 @@ parser.add_argument("-o", "--port", dest="port", action="store", type=int, metav
                     help="Port number to be started web application. (default: 8080).")
 parser.add_argument("--host", dest="host", action="store", type=str, metavar="HOST",
                     help="Host address to bind the web application. (default: 0.0.0.0).")
+parser.add_argument("--es-server", dest="esserver", action="store", type=str, metavar="ESSERVER",
+                    help="Elastic Search server address. (default: localhost:9200)")
+parser.add_argument("--es-index", dest="esindex", action="store", type=str, metavar="ESINDEX",
+                    help="Elastic Search index to search. (default: winlogbeat-*)")
+parser.add_argument("--es-prefix", dest="esprefix", action="store", type=str, metavar="ESPREFIX",
+                    help="Elastic Search event object prefix. (default: winlog)")
+parser.add_argument("--es-user", dest="esuser", action="store", type=str, metavar="ESUSER",
+                    help="Elastic Search ssl authentication user. (default: elastic)")
+parser.add_argument("--es-pass", dest="espassword", action="store", type=str, metavar="ESPASSWORD",
+                    help="Elastic Search ssl authentication password.")
+parser.add_argument("--es-cafile", dest="escafile", action="store", type=str, metavar="ESCAFILE",
+                    help="Elastic Search ssl cert file.")
+parser.add_argument("--es", action="store_true", default=False,
+                    help="Import data from Elastic Search. (default: False)")
+parser.add_argument("--postes", action="store_true", default=False,
+                    help="Post data to Elastic Search. (default: False)")
 parser.add_argument("-s", "--server", dest="server", action="store", type=str, metavar="SERVER",
                     help="Neo4j server. (default: localhost)")
 parser.add_argument("-u", "--user", dest="user", action="store", type=str, metavar="USERNAME",
                     help="Neo4j account name. (default: neo4j)")
 parser.add_argument("-p", "--password", dest="password", action="store", type=str, metavar="PASSWORD",
                     help="Neo4j password. (default: password).")
+parser.add_argument("--wsport", dest="wsport", action="store", type=str, metavar="PORT",
+                    help="Neo4j websocket port number.  (default: 7687).")
 parser.add_argument("-e", "--evtx", dest="evtx", nargs="*", action="store", type=str, metavar="EVTX",
                     help="Import to the AD EVTX file. (multiple files OK)")
 parser.add_argument("-x", "--xml", dest="xmls", nargs="*", action="store", type=str, metavar="XML",
@@ -198,9 +231,9 @@ parser.add_argument("-x", "--xml", dest="xmls", nargs="*", action="store", type=
 parser.add_argument("-z", "--timezone", dest="timezone", action="store", type=int, metavar="UTC",
                     help="Event log time zone. (for example: +9) (default: GMT)")
 parser.add_argument("-f", "--from", dest="fromdate", action="store", type=str, metavar="DATE",
-                    help="Parse Security Event log from this time. (for example: 20170101000000)")
+                    help="Parse Security Event log from this time. (for example: 2017-01-01T00:00:00)")
 parser.add_argument("-t", "--to", dest="todate", action="store", type=str, metavar="DATE",
-                    help="Parse Security Event log to this time. (for example: 20170228235959)")
+                    help="Parse Security Event log to this time. (for example: 2017-02-28T23:59:59)")
 parser.add_argument("--add", action="store_true", default=False,
                     help="Add additional data to Neo4j database. (default: False)")
 parser.add_argument("--delete", action="store_true", default=False,
@@ -261,6 +294,14 @@ statement_pr = """
   RETURN user, id
   """
 
+es_doc_user = """
+  {{"@timestamp":"{datetime}", "user":"{user}", "rights":"{rights}", "sid":"{sid}", "status":"{status}", "rank":{rank}}}
+  """
+
+es_doc_ip = """
+  {{"@timestamp":"{datetime}", "IP":"{IP}", "hostname":"{hostname}", "rank":{rank}}}
+  """
+
 if args.user:
     NEO4J_USER = args.user
 
@@ -275,6 +316,27 @@ if args.port:
 
 if args.host:
     WEB_HOST = args.host
+
+if args.wsport:
+    WS_PORT = args.wsport
+
+if args.esserver:
+    ES_SERVER = args.esserver
+
+if args.esindex:
+    ES_INDEX = args.esindex
+
+if args.esprefix:
+    ES_PREFIX = args.esprefix
+
+if args.esuser:
+    ES_USER = args.esuser
+
+if args.espassword:
+    ES_PASSWORD = args.espassword
+
+if args.escafile:
+    ES_CAFILE = args.escafile
 
 # Web application index.html
 @app.route('/')
@@ -304,7 +366,7 @@ def do_upload():
 
     if os.path.exists(UPLOAD_DIR) is False:
         os.mkdir(UPLOAD_DIR)
-        print("[+] make upload folder %s." % UPLOAD_DIR)
+        print("[+] make upload folder {0}.".format(UPLOAD_DIR))
 
     try:
         timezone = request.form["timezone"]
@@ -335,10 +397,67 @@ def do_upload():
         else:
             log_option = "--delete"
 
-        parse_command = "nohup python3 " + FPATH + "/logontracer.py " + log_option + " -z " + timezone + logoption + filelist + " -u " + NEO4J_USER + " -p " + NEO4J_PASSWORD + " >  " + FPATH + "/static/logontracer.log 2>&1 &"
+        parse_command = "nohup python3 " + FPATH + "/logontracer.py " + log_option + " -z " + timezone + logoption + filelist + " -s " + NEO4J_SERVER + " -u " + NEO4J_USER + " -p " + NEO4J_PASSWORD + " >  " + FPATH + "/static/logontracer.log 2>&1 &"
         subprocess.call("rm -f " + FPATH + "/static/logontracer.log > /dev/null", shell=True)
         subprocess.call(parse_command, shell=True)
         # parse_evtx(filename)
+        return "SUCCESS"
+
+    except:
+        return "FAIL"
+
+
+# Load from Elasticsearch
+@app.route("/esload", methods=["POST"])
+def es_load():
+    try:
+        fromdatetime = request.form["fromdatetime"]
+        todatetime = request.form["todatetime"]
+        timezone = request.form["timezone"]
+        es_server = request.form["es_server"]
+        addlog = request.form["addlog"]
+        addes = request.form["addes"]
+
+        if fromdatetime not in "false":
+            try:
+                datetime.datetime.strptime(fromdatetime, "%Y-%m-%dT%H:%M:%S")
+                fromdatetime = " -f " + fromdatetime
+            except:
+                return "FAIL"
+        else:
+            fromdatetime = ""
+
+        if todatetime not in "false":
+            try:
+                datetime.datetime.strptime(todatetime, "%Y-%m-%dT%H:%M:%S")
+                todatetime = " -t " + todatetime
+            except:
+                return "FAIL"
+        else:
+            todatetime = ""
+
+        es_ip, es_port = es_server.split(":")
+        if (re.search(IPv4_PATTERN, es_ip) or es_ip in "localhost") and re.search(r"\A\d{2,5}\Z", es_port):
+            es_server = " --es-server " + es_server
+        else:
+            return "FAIL"
+
+        if not re.search(r"\A-{0,1}[0-9]{1,2}\Z", timezone):
+            return "FAIL"
+
+        if addlog in "true":
+            log_option = "--add"
+        else:
+            log_option = "--delete"
+
+        if addes in "true":
+            es_option = " --postes "
+        else:
+            es_option = ""
+
+        parse_command = "nohup python3 " + FPATH + "/logontracer.py --es " + log_option + es_option + " -z " + timezone + fromdatetime + todatetime + es_server  + " -s " + NEO4J_SERVER + " -u " + NEO4J_USER + " -p " + NEO4J_PASSWORD + " --es-index " + ES_INDEX + " --es-prefix " + ES_PREFIX + " >  " + FPATH + "/static/logontracer.log 2>&1 &"
+        subprocess.call("rm -f " + FPATH + "/static/logontracer.log > /dev/null", shell=True)
+        subprocess.call(parse_command, shell=True)
         return "SUCCESS"
 
     except:
@@ -529,22 +648,34 @@ def learnhmm(frame, users, stime):
     joblib.dump(model, FPATH + "/model/hmm.pkl")
 
 
+# Post to Elastic Search cluster
+def post_es(index, es, doc):
+    es.index(index=index, body=doc)
+
+
+# Create mattings to Elastic Search
+def create_map(es, index):
+    with open(FPATH + "/es-index/" + index + ".json", "r") as f:
+        body = f.read()
+    es.indices.create(index=index, body=body)
+
+
 def to_lxml(record_xml):
     rep_xml = record_xml.replace("xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"", "")
-    set_xml = "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?>%s" % rep_xml
-    fin_xml = set_xml.encode("utf-8")
+    fin_xml = rep_xml.encode("utf-8")
     parser = etree.XMLParser(resolve_entities=False)
     return etree.fromstring(fin_xml, parser)
 
 
 def xml_records(filename):
     if args.evtx:
-        with Evtx(filename) as evtx:
-            for xml, record in evtx_file_xml_view(evtx.get_file_header()):
+        with open(filename, "rb") as evtx:
+            parser = PyEvtxParser(evtx)
+            for record in parser.records():
                 try:
-                    yield to_lxml(xml), None
+                    yield to_lxml(record["data"]), None
                 except etree.XMLSyntaxError as e:
-                    yield xml, e
+                    yield record["data"], e
 
     if args.xmls:
         xdata = ""
@@ -557,7 +688,7 @@ def xml_records(filename):
             for xml in xml_list:
                 if xml.startswith("<System>"):
                     try:
-                        yield to_lxml("<Event>" + xml), None
+                        yield to_lxml("<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?><Event>" + xml), None
                     except etree.XMLSyntaxError as e:
                         yield xml, e
 
@@ -633,31 +764,31 @@ def parse_evtx(evtx_list):
 
     if os.path.exists(cache_dir) is False:
         os.mkdir(cache_dir)
-        print("[+] make cache folder %s." % cache_dir)
+        print("[+] make cache folder {0}.".format(cache_dir))
 
     if args.timezone:
         try:
             datetime.timezone(datetime.timedelta(hours=args.timezone))
             tzone = args.timezone
-            print("[+] Time zone is %s." % args.timezone)
+            print("[+] Time zone is {0}.".format(args.timezone))
         except:
-            sys.exit("[!] Can't load time zone '%s'." % args.timezone)
+            sys.exit("[!] Can't load time zone {0}.".format(args.timezone))
     else:
         tzone = 0
 
     if args.fromdate:
         try:
-            fdatetime = datetime.datetime.strptime(args.fromdate, "%Y%m%d%H%M%S")
-            print("[+] Parse the EVTX from %s." % fdatetime.strftime("%Y-%m-%d %H:%M:%S"))
+            fdatetime = datetime.datetime.strptime(args.fromdate, "%Y-%m-%dT%H:%M:%S")
+            print("[+] Parse the EVTX from {0}.".format(fdatetime.strftime("%Y-%m-%d %H:%M:%S")))
         except:
-            sys.exit("[!] From date does not match format '%Y%m%d%H%M%S'.")
+            sys.exit("[!] From date does not match format '%Y-%m-%dT%H:%M:%S'.")
 
     if args.todate:
         try:
-            tdatetime = datetime.datetime.strptime(args.todate, "%Y%m%d%H%M%S")
-            print("[+] Parse the EVTX from %s." % tdatetime.strftime("%Y-%m-%d %H:%M:%S"))
+            tdatetime = datetime.datetime.strptime(args.todate, "%Y-%m-%dT%H:%M:%S")
+            print("[+] Parse the EVTX from {0}.".format(tdatetime.strftime("%Y-%m-%d %H:%M:%S")))
         except:
-            sys.exit("[!] To date does not match format '%Y%m%d%H%M%S'.")
+            sys.exit("[!] To date does not match format '%Y-%m-%dT%H:%M:%S'.")
 
     for evtx_file in evtx_list:
         if args.evtx:
@@ -666,19 +797,10 @@ def parse_evtx(evtx_list):
                 if fb_data != EVTX_HEADER:
                     sys.exit("[!] This file is not EVTX format {0}.".format(evtx_file))
 
-            chunk = -2
-            with Evtx(evtx_file) as evtx:
-                fh = evtx.get_file_header()
-                try:
-                    while True:
-                        last_chunk = list(evtx.chunks())[chunk]
-                        last_record = last_chunk.file_last_record_number()
-                        chunk -= 1
-                        if last_record > 0:
-                            record_sum = record_sum + last_record
-                            break
-                except:
-                    record_sum = record_sum + fh.next_record_number()
+            with open(evtx_file, "rb") as evtx:
+                parser = PyEvtxParser(evtx)
+                records = list(parser.records())
+                record_sum = len(records)
 
         if args.xmls:
             with open(evtx_file, "r") as fb:
@@ -688,13 +810,13 @@ def parse_evtx(evtx_list):
                 for line in fb:
                     record_sum += line.count("<System>")
 
-    print("[+] Last record number is %i." % record_sum)
+    print("[+] Last record number is {0}.".format(record_sum))
 
     # Parse Event log
     print("[+] Start parsing the EVTX file.")
 
     for evtx_file in evtx_list:
-        print("[+] Parse the EVTX file %s." % evtx_file)
+        print("[+] Parse the EVTX file {0}.".format(evtx_file))
 
         for node, err in xml_records(evtx_file):
             if err is not None:
@@ -703,7 +825,7 @@ def parse_evtx(evtx_list):
             eventid = int(node.xpath("/Event/System/EventID")[0].text)
 
             if not count % 100:
-                sys.stdout.write("\r[+] Now loading %i records." % count)
+                sys.stdout.write("\r[+] Now loading {0} records.".format(count))
                 sys.stdout.flush()
 
             if eventid in EVENT_ID:
@@ -954,12 +1076,12 @@ def parse_evtx(evtx_list):
                     deletelog.append("-")
 
     print("\n[+] Load finished.")
-    print("[+] Total Event log is %i." % count)
+    print("[+] Total Event log is {0}.".format(count))
 
     if not username_set or not len(event_set):
         sys.exit("[!] This event log did not include logs to be visualized. Please check the details of the event log.")
     else:
-        print("[+] Fildered Event log is %i." % len(event_set))
+        print("[+] Filtered Event log is {0}.".format(len(event_set)))
 
     tohours = int((endtime - starttime).total_seconds() / 3600)
 
@@ -1043,6 +1165,28 @@ def parse_evtx(evtx_list):
     except:
         sys.exit("[!] Can't connect Neo4j Database.")
 
+    if args.postes:
+        # Parse Event log
+        print("[+] Start sending the ES.")
+
+        # Create a new ES client
+        if args.espassword and args.escafile:
+            context = create_default_context(cafile=FPATH + ES_CAFILE)
+            client = Elasticsearch(ES_SERVER, http_auth=(ES_USER, ES_PASSWORD), scheme="https", ssl_context=context)
+        elif args.espassword:
+            client = Elasticsearch(ES_SERVER, http_auth=(ES_USER, ES_PASSWORD), scheme="https")
+        else:
+            client = Elasticsearch(ES_SERVER)
+
+        if client.indices.exists(index="logontracer-user-index") and client.indices.exists(index="logontracer-host-index") :
+            print("[+] Already created index mappings to ES.")
+        else:
+            create_map(client, "logontracer-host-index")
+            create_map(client, "logontracer-user-index")
+            print("[+] Creating index mappings to ES.")
+
+        es_timestamp = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
     tx = GRAPH.begin()
     hosts_inv = {v: k for k, v in hosts.items()}
     for ipaddress in event_set["ipaddress"].drop_duplicates():
@@ -1052,6 +1196,11 @@ def parse_evtx(evtx_list):
             hostname = ipaddress
         # add the IPAddress node to neo4j
         tx.run(statement_ip.format(**{"IP": ipaddress, "rank": ranks[ipaddress], "hostname": hostname}))
+
+        # add host data to Elasticsearch
+        if args.postes:
+            es_doc = es_doc_ip.format(**{"datetime": es_timestamp, "IP": ipaddress, "rank": ranks[ipaddress], "hostname": hostname})
+            post_es("logontracer-host-index", client, es_doc)
 
     i = 0
     for username in username_set:
@@ -1086,6 +1235,11 @@ def parse_evtx(evtx_list):
                                          "counts4769": ",".join(map(str, timelines[i*6+4])), "counts4776": ",".join(map(str, timelines[i*6+5])),
                                          "detect": ",".join(map(str, detects[i]))}))
         i += 1
+
+        # add user data to Elasticsearch
+        if args.postes:
+            es_doc = es_doc_user.format(**{"datetime": es_timestamp, "user": username[:-1], "rights": rights, "sid": sid, "status": ustatus, "rank": ranks[username]})
+            post_es("logontracer-user-index", client, es_doc)
 
     for domain in domains:
         # add the domain node to neo4j
@@ -1126,17 +1280,515 @@ def parse_evtx(evtx_list):
             tx.run(statement_pr.format(**{"user": username[:-1], "id": id, "date": policy[4]}))
             id += 1
 
-    tx.process()
+    #tx.process()
     tx.commit()
     print("[+] Creation of a graph data finished.")
 
+# Parse from Elastic Search cluster
+# Porting by 0xThiebaut
+def parse_es():
+    event_set = pd.DataFrame(index=[], columns=["eventid", "ipaddress", "username", "logintype", "status", "authname", "date"])
+    count_set = pd.DataFrame(index=[], columns=["dates", "eventid", "username"])
+    ml_frame = pd.DataFrame(index=[], columns=["date", "user", "host", "id"])
+    username_set = []
+    domain_set = []
+    admins = []
+    domains = []
+    ntmlauth = []
+    deletelog = []
+    policylist = []
+    addusers = {}
+    delusers = {}
+    addgroups = {}
+    removegroups = {}
+    sids = {}
+    hosts = {}
+    dcsync_count = {}
+    dcsync = {}
+    dcshadow_check = []
+    dcshadow = {}
+    count = 0
+    starttime = None
+    endtime = None
+    fdatetime = None
+    tdatetime = None
+
+    if args.timezone:
+        try:
+            datetime.timezone(datetime.timedelta(hours=args.timezone))
+            tzone = args.timezone
+            print("[+] Time zone is {0}.".format(args.timezone))
+        except:
+            sys.exit("[!] Can't load time zone {0}.".format(args.timezone))
+    else:
+        tzone = 0
+
+    if args.fromdate:
+        try:
+            fdatetime = datetime.datetime.strptime(args.fromdate, "%Y-%m-%dT%H:%M:%S")
+            print("[+] Search ES from {0}.".format(fdatetime.strftime("%Y-%m-%d %H:%M:%S")))
+        except:
+            sys.exit("[!] From date does not match format '%Y-%m-%dT%H:%M:%S'.")
+
+    if args.todate:
+        try:
+            tdatetime = datetime.datetime.strptime(args.todate, "%Y-%m-%dT%H:%M:%S")
+            print("[+] Search ES to {0}.".format(tdatetime.strftime("%Y-%m-%d %H:%M:%S")))
+        except:
+            sys.exit("[!] To date does not match format '%Y-%m-%dT%H:%M:%S'.")
+    # Parse Event log
+    print("[+] Start searching the ES.")
+
+    # Create a new ES client
+    if args.espassword and args.escafile:
+        context = create_default_context(cafile=FPATH + ES_CAFILE)
+        client = Elasticsearch(ES_SERVER, http_auth=(ES_USER, ES_PASSWORD), scheme="https", ssl_context=context)
+    elif args.espassword:
+        client = Elasticsearch(ES_SERVER, http_auth=(ES_USER, ES_PASSWORD), scheme="https")
+    else:
+        client = Elasticsearch(ES_SERVER)
+
+    # Create the search
+    s = Search(using=client, index=ES_INDEX)
+
+    if fdatetime or tdatetime:
+        filter = {"format": "epoch_millis"}
+        if fdatetime:
+            filter["gte"] = int(fdatetime.timestamp() * 1000)
+        if tdatetime:
+            filter["lt"] = int(tdatetime.timestamp() * 1000)
+        s = s.filter("range", **{'@timestamp': filter})
+
+    # Split the prefix
+    parts = ES_PREFIX.strip(".")
+    if len(parts) > 0:
+        parts = parts.split(".")
+    else:
+        parts = []
+    # Search for any event in EVENT_ID
+    parts.append("event_id")
+    field = ".".join(parts)
+    parts.pop()
+    queries = [Q("term", **{field:1102})]
+    for event_id in EVENT_ID:
+        queries.append(Q("term", **{field:event_id}))
+    query = Q("bool",
+              should=queries,
+              minimum_should_match=1)
+    s = s.query(query)
+
+    # Execute the search
+    for hit in s.scan():
+        event = hit
+        prefixed = True
+        for part in parts:
+            if hasattr(event, part):
+                event = getattr(event, part)
+            else:
+                prefixed = False
+                break
+
+        if not prefixed:
+            print("Skipping unexpected event...")
+            continue
+
+        count += 1
+        eventid = event.event_id
+
+        if not count % 100:
+            sys.stdout.write("\r[+] Now loading {0} records.".format(count))
+            sys.stdout.flush()
+
+        if eventid in EVENT_ID:
+            logtime = hit["@timestamp"].replace("T", " ").split(".")[0]
+            try:
+                etime = datetime.datetime.strptime(logtime.split(".")[0], "%Y-%m-%d %H:%M:%S") + datetime.timedelta(hours=tzone)
+            except:
+                etime = datetime.datetime.strptime(logtime.split(".")[0], "%Y-%m-%dT%H:%M:%S") + datetime.timedelta(hours=tzone)
+
+            stime = datetime.datetime(*etime.timetuple()[:4])
+
+            if starttime is None:
+                starttime = stime
+            elif starttime > etime:
+                starttime = stime
+
+            if endtime is None:
+                endtime = stime
+            elif endtime < etime:
+                endtime = stime
+
+            logintype = 0
+            username = "-"
+            domain = "-"
+            ipaddress = "-"
+            hostname = "-"
+            status = "-"
+            sid = "-"
+            authname = "-"
+
+            ###
+            # Detect admin users
+            #  EventID 4672: Special privileges assigned to new logon
+            ###
+            if eventid == 4672:
+                username = event.event_data.SubjectUserName.split("@")[0]
+                if username[-1:] not in "$":
+                    username = username.lower() + "@"
+                else:
+                    username = "-"
+                if username not in admins and username != "-":
+                    admins.append(username)
+            ###
+            # Detect removed user account and added user account.
+            #  EventID 4720: A user account was created
+            #  EventID 4726: A user account was deleted
+            ###
+            elif eventid in [4720, 4726]:
+                username = event.event_data.TargetUserName.split("@")[0]
+                if username[-1:] not in "$":
+                    username = username.lower() + "@"
+                else:
+                    username = "-"
+                if eventid == 4720:
+                    addusers[username] = etime.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    delusers[username] = etime.strftime("%Y-%m-%d %H:%M:%S")
+            ###
+            # Detect Audit Policy Change
+            #  EventID 4719: System audit policy was changed
+            ###
+            elif eventid == 4719:
+                username = event.event_data.SubjectUserName.split("@")[0]
+                if username[-1:] not in "$":
+                    username = username.lower() + "@"
+                else:
+                    username = "-"
+                category = event.event_data.CategoryId
+                guid = event.event_data.SubcategoryGuid
+                policylist.append([etime.strftime("%Y-%m-%d %H:%M:%S"), username, category, guid.lower(), int(stime.strftime("%s"))])
+            ###
+            # Detect added users from specific group
+            #  EventID 4728: A member was added to a security-enabled global group
+            #  EventID 4732: A member was added to a security-enabled local group
+            #  EventID 4756: A member was added to a security-enabled universal group
+            ###
+            elif eventid in [4728, 4732, 4756]:
+                groupname = event.event_data.TargetUserName
+                usid = event.event_data.MemberSid
+                addgroups[usid] = "AddGroup: " + groupname + "(" + etime.strftime("%Y-%m-%d %H:%M:%S") + ") "
+            ###
+            # Detect removed users from specific group
+            #  EventID 4729: A member was removed from a security-enabled global group
+            #  EventID 4733: A member was removed from a security-enabled local group
+            #  EventID 4757: A member was removed from a security-enabled universal group
+            ###
+            elif eventid in [4729, 4733, 4757]:
+                groupname = event.event_data.TargetUserName
+                usid = event.event_data.MemberSid
+                removegroups[usid] = "RemoveGroup: " + groupname + "(" + etime.strftime("%Y-%m-%d %H:%M:%S") + ") "
+            ###
+            # Detect DCSync
+            #  EventID 4662: An operation was performed on an object
+            ###
+            elif eventid == 4662:
+                username = event.event_data.SubjectUserName.split("@")[0]
+                if username[-1:] not in "$":
+                    username = username.lower() + "@"
+                else:
+                    username = "-"
+                dcsync_count[username] = dcsync_count.get(username, 0) + 1
+                if dcsync_count[username] == 3:
+                    dcsync[username] = etime.strftime("%Y-%m-%d %H:%M:%S")
+                    dcsync_count[username] = 0
+            ###
+            # Detect DCShadow
+            #  EventID 5137: A directory service object was created
+            #  EventID 5141: A directory service object was deleted
+            ###
+            elif eventid in [5137, 5141]:
+                username = event.event_data.SubjectUserName.split("@")[0]
+                if username[-1:] not in "$":
+                    username = username.lower() + "@"
+                else:
+                    username = "-"
+                if etime.strftime("%Y-%m-%d %H:%M:%S") in dcshadow_check:
+                    dcshadow[username] = etime.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    dcshadow_check.append(etime.strftime("%Y-%m-%d %H:%M:%S"))
+            ###
+            # Parse logon logs
+            #  EventID 4624: An account was successfully logged on
+            #  EventID 4625: An account failed to log on
+            #  EventID 4768: A Kerberos authentication ticket (TGT) was requested
+            #  EventID 4769: A Kerberos service ticket was requested
+            #  EventID 4776: The domain controller attempted to validate the credentials for an account
+            ###
+            else:
+                # parse IP Address
+                if hasattr(event.event_data, "IpAddress"):
+                    ipaddress = event.event_data.IpAddress.split("@")[0]
+                    ipaddress = ipaddress.lower().replace("::ffff:", "")
+                    ipaddress = ipaddress.replace("\\", "")
+                elif hasattr(event.event_data, "Workstation"):
+                    ipaddress = event.event_data.Workstation.split("@")[0]
+                    ipaddress = ipaddress.lower().replace("::ffff:", "")
+                    ipaddress = ipaddress.replace("\\", "")
+                # Parse hostname
+                if hasattr(event.event_data, "WorkstationName"):
+                    hostname = event.event_data.WorkstationName.split("@")[0]
+                    hostname = hostname.lower().replace("::ffff:", "")
+                    hostname = hostname.replace("\\", "")
+                # Parse username
+                if hasattr(event.event_data, "TargetUserName"):
+                    username = event.event_data.TargetUserName.split("@")[0]
+                    if username[-1:] not in "$":
+                        username = username.lower() + "@"
+                    else:
+                        username = "-"
+                # Parse targeted domain name
+                if hasattr(event.event_data, "TargetDomainName"):
+                    domain = event.event_data.TargetDomainName
+                # parse trageted user SID
+                if hasattr(event.event_data, "TargetUserSid"):
+                    sid = event.event_data.TargetUserSid
+                if hasattr(event.event_data, "TargetSid"):
+                    sid = event.event_data.TargetSid
+                # parse login type
+                if hasattr(event.event_data, "LogonType"):
+                    logintype = event.event_data.LogonType
+                # parse status
+                if hasattr(event.event_data, "Status"):
+                    status = event.event_data.Status
+                # parse Authentication package name
+                if hasattr(event.event_data, "AuthenticationPackageName"):
+                    authname = event.event_data.AuthenticationPackageName
+                if username != "-" and username != "anonymous logon" and ipaddress != "::1" and ipaddress != "127.0.0.1" and (ipaddress != "-" or hostname != "-"):
+                    # generate pandas series
+                    if ipaddress != "-":
+                        event_series = pd.Series([eventid, ipaddress, username, logintype, status, authname, int(stime.strftime("%s"))], index=event_set.columns)
+                        ml_series = pd.Series([etime.strftime("%Y-%m-%d %H:%M:%S"), username, ipaddress, eventid],  index=ml_frame.columns)
+                    else:
+                        event_series = pd.Series([eventid, hostname, username, logintype, status, authname, int(stime.strftime("%s"))], index=event_set.columns)
+                        ml_series = pd.Series([etime.strftime("%Y-%m-%d %H:%M:%S"), username, hostname, eventid],  index=ml_frame.columns)
+                    # append pandas series to dataframe
+                    event_set = event_set.append(event_series, ignore_index=True)
+                    ml_frame = ml_frame.append(ml_series, ignore_index=True)
+                    # print("%s,%i,%s,%s,%s,%s" % (eventid, ipaddress, username, comment, logintype))
+                    count_series = pd.Series([stime.strftime("%Y-%m-%d %H:%M:%S"), eventid, username], index=count_set.columns)
+                    count_set = count_set.append(count_series, ignore_index=True)
+                    # print("%s,%s" % (stime.strftime("%Y-%m-%d %H:%M:%S"), username))
+
+                    if domain != "-":
+                        domain_set.append([username, domain])
+
+                    if username not in username_set:
+                        username_set.append(username)
+
+                    if domain not in domains and domain != "-":
+                        domains.append(domain)
+
+                    if sid != "-":
+                        sids[username] = sid
+
+                    if hostname != "-" and ipaddress != "-":
+                        hosts[ipaddress] = hostname
+
+                    if authname in "NTML" and authname not in ntmlauth:
+                        ntmlauth.append(username)
+        ###
+        # Detect the audit log deletion
+        # EventID 1102: The audit log was cleared
+        ###
+        if eventid == 1102:
+            logtime = hit["@timestamp"]
+            try:
+                etime = datetime.datetime.strptime(logtime.split(".")[0], "%Y-%m-%d %H:%M:%S") + datetime.timedelta(hours=tzone)
+            except:
+                etime = datetime.datetime.strptime(logtime.split(".")[0], "%Y-%m-%dT%H:%M:%S") + datetime.timedelta(hours=tzone)
+            deletelog.append(etime.strftime("%Y-%m-%d %H:%M:%S"))
+
+            if hasattr(event.user_data, "SubjectUserName"):
+                username = event.user_data.SubjectUserName.split("@")[0]
+                if username[-1:] not in "$":
+                    deletelog.append(username.lower())
+                else:
+                    deletelog.append("-")
+            else:
+                deletelog.append("-")
+
+            if hasattr(event.user_data, "SubjectDomainName"):
+                deletelog.append(event.user_data.SubjectDomainName)
+            else:
+                deletelog.append("-")
+
+    print("\n[+] Load finished.")
+    print("[+] Total Event log is {0}.".format(count))
+
+    if not username_set or not len(event_set):
+        sys.exit("[!] This event log did not include logs to be visualized. Please check the details of the event log.")
+    else:
+        print("[+] Filtered Event log is {0}.".format(len(event_set)))
+
+    tohours = int((endtime - starttime).total_seconds() / 3600)
+
+    if hosts:
+        event_set = event_set.replace(hosts)
+    event_set_bydate = event_set
+    event_set_bydate["count"] = event_set_bydate.groupby(["eventid", "ipaddress", "username", "logintype", "status", "authname", "date"])["eventid"].transform("count")
+    event_set_bydate = event_set_bydate.drop_duplicates()
+    event_set = event_set.drop("date", axis=1)
+    event_set["count"] = event_set.groupby(["eventid", "ipaddress", "username", "logintype", "status", "authname"])["eventid"].transform("count")
+    event_set = event_set.drop_duplicates()
+    count_set["count"] = count_set.groupby(["dates", "eventid", "username"])["dates"].transform("count")
+    count_set = count_set.drop_duplicates()
+    domain_set_uniq = list(map(list, set(map(tuple, domain_set))))
+
+    # Learning event logs using Hidden Markov Model
+    if hosts:
+        ml_frame = ml_frame.replace(hosts)
+    ml_frame = ml_frame.sort_values(by="date")
+    if args.learn:
+        print("[+] Learning event logs using Hidden Markov Model.")
+        learnhmm(ml_frame, username_set, datetime.datetime(*starttime.timetuple()[:3]))
+
+    # Calculate ChangeFinder
+    print("[+] Calculate ChangeFinder.")
+    timelines, detects, detect_cf = adetection(count_set, username_set, starttime, tohours)
+
+    # Calculate Hidden Markov Model
+    print("[+] Calculate Hidden Markov Model.")
+    detect_hmm = decodehmm(ml_frame, username_set, datetime.datetime(*starttime.timetuple()[:3]))
+
+    # Calculate PageRank
+    print("[+] Calculate PageRank.")
+    ranks = pagerank(event_set, admins, detect_hmm, detect_cf, ntmlauth)
+
+    # Create node
+    print("[+] Creating a graph data.")
+
+    try:
+        graph_http = "http://" + NEO4J_USER + ":" + NEO4J_PASSWORD + "@" + NEO4J_SERVER + ":" + NEO4J_PORT + "/db/data/"
+        GRAPH = Graph(graph_http)
+    except:
+        sys.exit("[!] Can't connect Neo4j Database.")
+
+    if args.postes:
+        # Parse Event log
+        print("[+] Start sending the ES.")
+
+        if client.indices.exists(index="logontracer-user-index") and client.indices.exists(index="logontracer-host-index") :
+            print("[+] Already created index mappings to ES.")
+        else:
+            create_map(client, "logontracer-host-index")
+            create_map(client, "logontracer-user-index")
+            print("[+] Creating index mappings to ES.")
+
+        es_timestamp = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+    tx = GRAPH.begin()
+    hosts_inv = {v: k for k, v in hosts.items()}
+    for ipaddress in event_set["ipaddress"].drop_duplicates():
+        if ipaddress in hosts_inv:
+            hostname = hosts_inv[ipaddress]
+        else:
+            hostname = ipaddress
+        # add the IPAddress node to neo4j
+        tx.run(statement_ip.format(**{"IP": ipaddress, "rank": ranks[ipaddress], "hostname": hostname}))
+
+        # add host data to Elasticsearch
+        if args.postes:
+            es_doc = es_doc_ip.format(**{"datetime": es_timestamp, "IP": ipaddress, "rank": ranks[ipaddress], "hostname": hostname})
+            post_es("logontracer-host-index", client, es_doc)
+
+    i = 0
+    for username in username_set:
+        if username in sids:
+            sid = sids[username]
+        else:
+            sid = "-"
+        if username in admins:
+            rights = "system"
+        else:
+            rights = "user"
+        ustatus = ""
+        if username in addusers:
+            ustatus += "Created(" + addusers[username] + ") "
+        if username in delusers:
+            ustatus += "Deleted(" + delusers[username] + ") "
+        if sid in addgroups:
+            ustatus += addgroups[sid]
+        if sid in removegroups:
+            ustatus += removegroups[sid]
+        if username in dcsync:
+            ustatus += "DCSync(" + dcsync[username] + ") "
+        if username in dcshadow:
+            ustatus += "DCShadow(" + dcshadow[username] + ") "
+        if not ustatus:
+            ustatus = "-"
+
+        # add the username node to neo4j
+        tx.run(statement_user.format(**{"user": username[:-1], "rank": ranks[username], "rights": rights, "sid": sid, "status": ustatus,
+                                         "counts": ",".join(map(str, timelines[i*6])), "counts4624": ",".join(map(str, timelines[i*6+1])),
+                                         "counts4625": ",".join(map(str, timelines[i*6+2])), "counts4768": ",".join(map(str, timelines[i*6+3])),
+                                         "counts4769": ",".join(map(str, timelines[i*6+4])), "counts4776": ",".join(map(str, timelines[i*6+5])),
+                                         "detect": ",".join(map(str, detects[i]))}))
+        i += 1
+
+        # add user data to Elasticsearch
+        if args.postes:
+            es_doc = es_doc_user.format(**{"datetime": es_timestamp, "user": username[:-1], "rights": rights, "sid": sid, "status": ustatus, "rank": ranks[username]})
+            post_es("logontracer-user-index", client, es_doc)
+
+    for domain in domains:
+        # add the domain node to neo4j
+        tx.run(statement_domain.format(**{"domain": domain}))
+
+    for _, events in event_set_bydate.iterrows():
+        # add the (username)-(event)-(ip) link to neo4j
+        tx.run(statement_r.format(**{"user": events["username"][:-1], "IP": events["ipaddress"], "id": events["eventid"], "logintype": events["logintype"],
+                                      "status": events["status"], "count": events["count"], "authname": events["authname"], "date": events["date"]}))
+
+    for username, domain in domain_set_uniq:
+        # add (username)-()-(domain) link to neo4j
+        tx.run(statement_dr.format(**{"user": username[:-1], "domain": domain}))
+
+    # add the date node to neo4j
+    tx.run(statement_date.format(**{"Daterange": "Daterange", "start": datetime.datetime(*starttime.timetuple()[:4]).strftime("%Y-%m-%d %H:%M:%S"),
+                                     "end": datetime.datetime(*endtime.timetuple()[:4]).strftime("%Y-%m-%d %H:%M:%S")}))
+
+    if len(deletelog):
+        # add the delete flag node to neo4j
+        tx.run(statement_del.format(**{"deletetime": deletelog[0], "user": deletelog[1], "domain": deletelog[2]}))
+
+    if len(policylist):
+        id = 0
+        for policy in policylist:
+            if policy[2] in CATEGORY_IDs:
+                category = CATEGORY_IDs[policy[2]]
+            else:
+                category = policy[2]
+            if policy[3] in AUDITING_CONSTANTS:
+                sub = AUDITING_CONSTANTS[policy[3]]
+            else:
+                sub = policy[3]
+            username = policy[1]
+            # add the policy id node to neo4j
+            tx.run(statement_pl.format(**{"id": id, "changetime": policy[0], "category": category, "sub": sub}))
+            # add (username)-(policy)-(id) link to neo4j
+            tx.run(statement_pr.format(**{"user": username[:-1], "id": id, "date": policy[4]}))
+            id += 1
+
+    #tx.process()
+    tx.commit()
+    print("[+] Creation of a graph data finished.")
 
 def main():
     if not has_py2neo:
         sys.exit("[!] py2neo must be installed for this script.")
 
     if not has_evtx:
-        sys.exit("[!] python-evtx must be installed for this script.")
+        sys.exit("[!] evtx must be installed for this script.")
 
     if not has_lxml:
         sys.exit("[!] lxml must be installed for this script.")
@@ -1156,17 +1808,20 @@ def main():
     if not has_sklearn:
         sys.exit("[!] scikit-learn must be installed for this script.")
 
+    if not has_es:
+        sys.exit("[!] elasticsearch-dsl must be installed for this script.")
+
     try:
         graph_http = "http://" + NEO4J_USER + ":" + NEO4J_PASSWORD + "@" + NEO4J_SERVER + ":" + NEO4J_PORT + "/db/data/"
         GRAPH = Graph(graph_http)
-        db = Database(host=NEO4J_SERVER, user=NEO4J_USER, password=NEO4J_PASSWORD, bolt=True)
+        db = GraphService(host=NEO4J_SERVER, user=NEO4J_USER, password=NEO4J_PASSWORD, bolt=True)
     except:
         sys.exit("[!] Can't connect Neo4j Database.")
 
-    print("[+] Script start. %s" % datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
+    print("[+] Script start. {0}".format(datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")))
 
     try:
-        print("[+] Neo4j Kernel version: {0}".format(".".join(map(str, db.kernel_start_time))))
+        print("[+] Neo4j Kernel version: {0}".format(db.kernel_version))
     except:
         print("[!] Can't get Neo4j kernel version.")
 
@@ -1184,7 +1839,7 @@ def main():
         cache_dir = os.path.join(FPATH, 'cache')
         if os.path.exists(cache_dir):
             shutil.rmtree(cache_dir)
-            print("[+] Delete cache folder %s." % cache_dir)
+            print("[+] Delete cache folder {0}.".format(cache_dir))
 
     if args.evtx:
         for evtx_file in args.evtx:
@@ -1198,7 +1853,10 @@ def main():
                 sys.exit("[!] Can't open file {0}.".format(xml_file))
         parse_evtx(args.xmls)
 
-    print("[+] Script end. %s" % datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
+    if args.es:
+        parse_es()
+
+    print("[+] Script end. {0}".format(datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")))
 
 
 if __name__ == "__main__":
